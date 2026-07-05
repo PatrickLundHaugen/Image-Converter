@@ -1,5 +1,6 @@
 <script lang="ts">
-    import { onMount } from 'svelte';
+    import { onMount, setContext } from 'svelte';
+    import { APP_CONTEXT_KEY, type AppContext } from './lib/context.js';
     import { theme } from './lib/stores/theme.js';
     import type { ImageItem, Format, CropOptions } from './lib/types.js';
     import { convertImage, getImageDimensions, isUnsupportedFormat } from './lib/utils/converter.js';
@@ -7,87 +8,96 @@
     import { formatBytes, savingsPercent } from './lib/utils/filesize.js';
     import DropZone from './lib/components/DropZone.svelte';
     import ComparisonViewer from './lib/components/ComparisonViewer.svelte';
-    import FormatSelector from './lib/components/FormatSelector.svelte';
-    import QualitySlider from './lib/components/QualitySlider.svelte';
-    import ResizeControl from './lib/components/ResizeControl.svelte';
-    import ThemeToggle from './lib/components/ThemeToggle.svelte';
-    import Button from './lib/components/Button.svelte';
+    import Header from './lib/components/Header.svelte';
+    import Sidebar from './lib/components/Sidebar.svelte';
 
     let items = $state<ImageItem[]>([]);
     let format = $state<Format>('image/webp');
     let quality = $state(85);
-    let cropEnabled    = $state(false);
+    let cropEnabled = $state(false);
     let cropLockAspect = $state(true);
     let crop = $state({ x: 0, y: 0, width: 0, height: 0 });
     let selectedId = $state<string | null>(null);
     let downloadingZip = $state(false);
     let copyState = $state<'idle' | 'copied' | 'error'>('idle');
-    let debounceTimer: ReturnType<typeof setTimeout>;
     let toast = $state<string | null>(null);
+
+    // Not reactive — just timer handles; declared near the functions that own them.
     let toastTimer: ReturnType<typeof setTimeout>;
+    let debounceTimer: ReturnType<typeof setTimeout>;
 
     function showToast(msg: string) {
         toast = msg;
         clearTimeout(toastTimer);
         toastTimer = setTimeout(() => (toast = null), 5000);
     }
-    let addMoreInput = $state<HTMLInputElement>();
+
 
     const selectedItem = $derived(
         (selectedId ? items.find((i) => i.id === selectedId) : null) ?? items[0] ?? null
     );
 
-    $effect(() => {
-        const t = $theme;
-        const prefersDark = window.matchMedia('(prefers-color-scheme: dark)').matches;
-        const isDark = t === 'dark' || (t === 'system' && prefersDark);
-        document.documentElement.classList.toggle('dark', isDark);
-    });
-
     onMount(() => {
-        const mq = window.matchMedia('(prefers-color-scheme: dark)');
-        const handler = () => {
-            if ($theme === 'system') document.documentElement.classList.toggle('dark', mq.matches);
-        };
-        mq.addEventListener('change', handler);
-
         // Restore last used settings
         const savedFormat = localStorage.getItem('imgconv-format') as Format | null;
         const savedQuality = localStorage.getItem('imgconv-quality');
         if (savedFormat && ['image/png', 'image/jpeg', 'image/webp'].includes(savedFormat)) format = savedFormat;
         if (savedQuality) quality = Math.max(1, Math.min(100, Number(savedQuality)));
 
-        return () => mq.removeEventListener('change', handler);
+        // Keep dark class in sync when OS preference changes while theme is 'system'.
+        const mq = window.matchMedia('(prefers-color-scheme: dark)');
+        const onOsChange = () => {
+            if ($theme === 'system') {
+                document.documentElement.classList.toggle('dark', mq.matches);
+            }
+        };
+        mq.addEventListener('change', onOsChange);
+
+        return () => {
+            mq.removeEventListener('change', onOsChange);
+            clearTimeout(debounceTimer);
+            clearTimeout(toastTimer);
+        };
     });
 
-    const FORMAT_LABELS: Record<string, string> = {
-        'image/png': 'PNG', 'image/jpeg': 'JPEG', 'image/webp': 'WebP',
-    };
 
     async function addFiles(files: File[]) {
         const MAX_SIZE = 15 * 1024 * 1024; // 15 MB
+
+        // Reject unsupported formats immediately with a toast; collect supported files.
+        const supported: File[] = [];
         for (const file of files) {
             if (isUnsupportedFormat(file)) {
                 showToast(`"${file.name}" is HEIC/HEIF — not supported by the browser. Convert to JPEG or PNG first.`);
                 const item: ImageItem = {
                     id: crypto.randomUUID(), file, name: file.name,
                     originalSize: file.size, width: 0, height: 0,
-                    convertedBlob: null, convertedSize: null,
-                    converting: false, error: 'HEIC/HEIF not supported',
+                    unsupported: true, conversionId: 0, convertedBlob: null, convertedSize: null, thumbnailUrl: URL.createObjectURL(file),
+                    converting: false, error: 'HEIC/HEIF not supported', lastSavings: null,
                 };
                 items.push(item);
                 if (!selectedId) selectedId = item.id;
-                continue;
+            } else {
+                if (file.size > MAX_SIZE) {
+                    showToast(`"${file.name}" is large (${formatBytes(file.size)}) — conversion may be slow`);
+                }
+                supported.push(file);
             }
-            if (file.size > MAX_SIZE) {
-                showToast(`"${file.name}" is large (${formatBytes(file.size)}) — conversion may be slow`);
-            }
-            const { width, height } = await getImageDimensions(file);
+        }
+
+        // Read all dimensions in parallel rather than sequentially.
+        const dims = await Promise.all(supported.map(getImageDimensions));
+
+        for (let i = 0; i < supported.length; i++) {
+            const file = supported[i];
+            const { width, height } = dims[i];
+            // Create the URL immediately before push so it's always reachable via items[] for cleanup.
+            const thumbnailUrl = URL.createObjectURL(file);
             const item: ImageItem = {
                 id: crypto.randomUUID(), file, name: file.name,
                 originalSize: file.size, width, height,
-                convertedBlob: null, convertedSize: null,
-                converting: true, error: null,
+                unsupported: false, conversionId: 0, convertedBlob: null, convertedSize: null, thumbnailUrl,
+                converting: true, error: null, lastSavings: null,
             };
             items.push(item);
             if (!selectedId) selectedId = item.id;
@@ -95,53 +105,70 @@
         }
     }
 
-    function buildCrop(): CropOptions | undefined {
-        if (!cropEnabled || !crop.width || !crop.height) return undefined;
-        return { enabled: true, ...crop };
-    }
+    const currentCrop = $derived<CropOptions | undefined>(
+        cropEnabled && crop.width && crop.height
+            ? { enabled: true, ...crop }
+            : undefined
+    );
 
     async function convertItem(id: string) {
         const item = items.find((i) => i.id === id);
         if (!item) return;
+        const generation = ++item.conversionId;
         item.converting = true;
         item.error = null;
         try {
-            const blob = await convertImage(item.file, format, quality, buildCrop());
+            const blob = await convertImage(item.file, format, quality, currentCrop);
+            // Discard result if a newer conversion started while this one was in flight
+            if (item.conversionId !== generation) return;
             item.convertedBlob = blob;
             item.convertedSize = blob.size;
+            item.lastSavings = savingsPercent(item.originalSize, blob.size);
         } catch {
+            if (item.conversionId !== generation) return;
             item.error = 'Conversion failed';
         } finally {
-            item.converting = false;
+            if (item.conversionId === generation) item.converting = false;
         }
     }
 
     function reconvertAll() {
         for (const item of items) {
-            if (item.error) continue;
+            if (item.unsupported) continue; // permanent — browser can't decode this format
             void convertItem(item.id);
         }
     }
 
+    // Persist format and quality to localStorage whenever they change.
+    $effect(() => { localStorage.setItem('imgconv-format', format); });
+    $effect(() => { localStorage.setItem('imgconv-quality', String(quality)); });
+
     function handleFormatChange(f: Format) {
         format = f;
-        localStorage.setItem('imgconv-format', f);
         reconvertAll();
+    }
+
+    function debouncedReconvert() {
+        clearTimeout(debounceTimer);
+        debounceTimer = setTimeout(reconvertAll, 400);
     }
 
     function handleQualityChange(q: number) {
         quality = q;
-        localStorage.setItem('imgconv-quality', String(q));
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(reconvertAll, 400);
+        debouncedReconvert();
     }
 
     function handleCropToggle() {
         cropEnabled = !cropEnabled;
         if (cropEnabled && selectedItem) {
             crop = { x: 0, y: 0, width: selectedItem.width, height: selectedItem.height };
+        } else if (selectedItem) {
+            const isFullImage =
+                crop.x === 0 && crop.y === 0 &&
+                crop.width === selectedItem.width &&
+                crop.height === selectedItem.height;
+            if (!isFullImage) reconvertAll();
         }
-        reconvertAll();
     }
 
     function handleCropLockToggle() {
@@ -155,24 +182,30 @@
         const x = Math.min(crop.x, (selectedItem?.width  ?? w) - w);
         const y = Math.min(crop.y, (selectedItem?.height ?? h) - h);
         crop = { x: Math.max(0, x), y: Math.max(0, y), width: w, height: h };
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(reconvertAll, 400);
+        debouncedReconvert();
     }
 
     function handleCropFrameChange(c: { x: number; y: number; width: number; height: number }) {
         crop = c;
-        clearTimeout(debounceTimer);
-        debounceTimer = setTimeout(reconvertAll, 400);
     }
 
     function removeItem(id: string) {
         const idx = items.findIndex((i) => i.id === id);
         if (idx === -1) return;
+        URL.revokeObjectURL(items[idx].thumbnailUrl);
         items.splice(idx, 1);
-        if (selectedId === id) selectedId = items[idx]?.id ?? items[idx - 1]?.id ?? null;
+        if (selectedId === id) {
+            // After splice: items[idx] is the next item (if any), items[idx-1] is the previous.
+            // Prefer the next item so the selection moves forward; fall back to previous.
+            selectedId = items[idx]?.id ?? items[idx - 1]?.id ?? null;
+        }
     }
 
-    function clearAll() { items = []; selectedId = null; }
+    function clearAll() {
+        for (const item of items) URL.revokeObjectURL(item.thumbnailUrl);
+        items = [];
+        selectedId = null;
+    }
 
     async function handleDownloadAll() {
         downloadingZip = true;
@@ -181,27 +214,31 @@
     }
 
     function downloadSelected() {
+        // convertedBlob retains the last successful result during reconversion, so this
+        // always downloads the most recent completed output even if converting is true.
         if (selectedItem?.convertedBlob)
             downloadBlob(selectedItem.convertedBlob, getOutputFilename(selectedItem.name, format));
     }
 
-    function handleAddMoreInput(e: Event) {
-        const target = e.target as HTMLInputElement;
-        if (!target.files) return;
-        const files = Array.from(target.files).filter((f) => f.type.startsWith('image/'));
-        if (files.length) void addFiles(files);
-        target.value = '';
-    }
-
     async function copyToClipboard() {
-        if (!selectedItem?.convertedBlob) return;
+        const blob = selectedItem?.convertedBlob;
+        if (!blob) return;
         try {
-            await navigator.clipboard.write([
-                new ClipboardItem({ [selectedItem.convertedBlob.type]: selectedItem.convertedBlob }),
-            ]);
+            await navigator.clipboard.write([new ClipboardItem({ [blob.type]: blob })]);
             copyState = 'copied';
-        } catch {
+        } catch (err) {
             copyState = 'error';
+            // ClipboardItem rejects for unsupported MIME types (e.g. WebP on Safari) or
+            // when the page doesn't have clipboard-write permission.
+            const isTypeError = err instanceof DOMException && err.name === 'NotAllowedError';
+            const isWebP = blob.type === 'image/webp';
+            if (isWebP && isTypeError) {
+                showToast("Copy failed — your browser doesn't support copying WebP. Try JPEG or PNG.");
+            } else if (isTypeError) {
+                showToast('Clipboard access was denied. Check your browser permissions.');
+            } else {
+                showToast('Copy failed — your browser may not support this format.');
+            }
         }
         setTimeout(() => (copyState = 'idle'), 2000);
     }
@@ -217,37 +254,50 @@
         }
     }
 
-    const savings = $derived(
-        selectedItem?.convertedSize != null
-            ? savingsPercent(selectedItem.originalSize, selectedItem.convertedSize)
-            : null
-    );
+    // Expose state and actions to child components via context.
+    // Using a getter object so derived/state values remain reactive when read in children.
+    setContext<AppContext>(APP_CONTEXT_KEY, {
+        get items()          { return items; },
+        get selectedItem()   { return selectedItem; },
+        get format()         { return format; },
+        get quality()        { return quality; },
+        get copyState()      { return copyState; },
+        get downloadingZip() { return downloadingZip; },
+        get cropEnabled()    { return cropEnabled; },
+        get crop()           { return crop; },
+        get cropLockAspect() { return cropLockAspect; },
+        addFiles,
+        selectItem: (id) => { selectedId = id; },
+        removeItem,
+        handleFormatChange,
+        handleQualityChange,
+        handleCropToggle,
+        handleCropLockToggle,
+        handleCropChange,
+        downloadSelected,
+        copyToClipboard,
+        handleDownloadAll,
+        clearAll,
+    });
 </script>
 
 <svelte:window onkeydown={onKeyDown} />
 
-<div class="min-h-screen bg-white dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 flex flex-col transition-colors">
+<div class="min-h-screen bg-neutral-50 dark:bg-neutral-900 text-neutral-900 dark:text-neutral-100 flex flex-col transition-colors">
 
-    <!-- Header -->
-    <header class="border-b border-neutral-200 dark:border-neutral-800 px-6 py-4 flex items-center justify-between shrink-0 z-30 relative bg-white dark:bg-neutral-900">
-        <h1 class="font-display text-lg font-semibold tracking-tight">imgconv</h1>
-        <ThemeToggle />
-    </header>
+    <Header />
 
     {#if items.length === 0}
         <main class="flex-1 flex items-center justify-center p-8">
             <div class="w-full max-w-lg flex flex-col gap-6">
                 <div class="text-center flex flex-col gap-2">
-                    <h2 class="font-display text-3xl font-semibold tracking-tight">imgconv</h2>
+                    <h2 class="font-display text-3xl font-semibold tracking-tight">Image Converter</h2>
                     <p class="text-sm text-neutral-500 dark:text-neutral-400">
-                        Convert and crop images to PNG, JPEG, or WebP — right in your browser.
+                        Convert and crop images to PNG, JPEG, or WebP right in your browser.
                     </p>
                 </div>
                 <DropZone onfiles={addFiles} />
                 <p class="text-xs text-center text-neutral-400 dark:text-neutral-600">
-                    Drop · click · or paste &nbsp;·&nbsp; nothing leaves your device
-                </p>
-                <p class="text-xs text-center text-neutral-300 dark:text-neutral-700">
                     JPEG · PNG · WebP · GIF · SVG · AVIF · BMP
                 </p>
             </div>
@@ -263,161 +313,14 @@
                     <ComparisonViewer
                             item={selectedItem}
                             {format}
-                            crop={cropEnabled ? { enabled: true, ...crop } : undefined}
+                            crop={currentCrop}
                             lockAspect={cropLockAspect}
                             oncropchange={handleCropFrameChange}
                     />
                 {/if}
             </div>
 
-            <!-- Sidebar overlay -->
-            <aside class="absolute top-0 left-0 bottom-0 z-20 flex flex-col
-                     w-full lg:w-[360px]
-                     bg-white dark:bg-neutral-900
-                     border-r border-neutral-200 dark:border-neutral-800
-                     lg:border lg:top-2 lg:left-2 lg:bottom-2
-                     lg:rounded-2xl lg:shadow-2xl
-                     overflow-hidden
-                     lg:max-h-full max-h-[50%]">
-
-                <!-- Add more -->
-                <div class="px-3 pt-3 pb-2 shrink-0 border-b border-neutral-100 dark:border-neutral-800">
-                    <button
-                            onclick={() => addMoreInput?.click()}
-                            class="w-full text-xs text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200
-                   border border-dashed border-neutral-300 dark:border-neutral-700
-                   hover:border-neutral-500 dark:hover:border-neutral-500
-                   rounded-lg py-2 transition-colors cursor-pointer"
-                    >
-                        + Add more images
-                    </button>
-                    <input bind:this={addMoreInput} type="file" accept="image/*" multiple class="sr-only" oninput={handleAddMoreInput} />
-                </div>
-
-                <!-- Scrollable body: image list + controls -->
-                <div class="flex-1 min-h-0 overflow-y-auto">
-
-                    <!-- Image list -->
-                    <div class="p-2 flex flex-col gap-1">
-                        {#each items as item (item.id)}
-                            {@const isSelected = selectedItem?.id === item.id}
-                            {@const thumbSavings = item.convertedSize !== null ? savingsPercent(item.originalSize, item.convertedSize) : null}
-                            {@const thumbUrl = URL.createObjectURL(item.file)}
-                            <!-- svelte-ignore a11y_interactive_supports_focus -->
-                            <div
-                                    role="button"
-                                    tabindex="0"
-                                    onclick={() => (selectedId = item.id)}
-                                    onkeydown={(e) => e.key === 'Enter' && (selectedId = item.id)}
-                                    class="group flex items-center gap-2.5 p-2 rounded-lg transition-colors cursor-pointer
-                       {isSelected
-                         ? 'bg-neutral-100 dark:bg-neutral-800'
-                         : 'hover:bg-neutral-50 dark:hover:bg-neutral-800/50'}"
-                            >
-                                <div class="size-10 shrink-0 rounded-md overflow-hidden bg-neutral-200 dark:bg-neutral-700">
-                                    <img src={thumbUrl} alt="" class="size-full object-cover" />
-                                </div>
-                                <div class="flex-1 min-w-0">
-                                    <p class="text-xs font-medium truncate leading-tight">{item.name}</p>
-                                    {#if item.error}
-                                        <p class="text-xs text-red-500 dark:text-red-400 mt-0.5 truncate">{item.error}</p>
-                                    {:else}
-                                        <p class="text-xs text-neutral-400 dark:text-neutral-500 tabular-nums mt-0.5">
-                                            {formatBytes(item.originalSize)}
-                                            {#if !item.converting && thumbSavings !== null && thumbSavings > 0}
-                                                <span class="text-green-600 dark:text-green-400">−{thumbSavings}%</span>
-                                            {:else if !item.converting && thumbSavings !== null && thumbSavings < 0}
-                                                <span class="text-amber-500">+{Math.abs(thumbSavings)}%</span>
-                                            {/if}
-                                            <span class="text-neutral-300 dark:text-neutral-600">·</span>
-                                            <span>{FORMAT_LABELS[format]}</span>
-                                        </p>
-                                    {/if}
-                                </div>
-                                <button
-                                        onclick={(e) => { e.stopPropagation(); removeItem(item.id); }}
-                                        class="size-5 rounded flex items-center justify-center shrink-0
-                         text-neutral-400 hover:text-neutral-700 dark:hover:text-neutral-200
-                         opacity-0 group-hover:opacity-100 transition-opacity cursor-pointer"
-                                        aria-label="Remove {item.name}"
-                                >
-                                    <svg viewBox="0 0 16 16" class="size-3 fill-current">
-                                        <path d="M4.22 4.22a.75.75 0 011.06 0L8 6.94l2.72-2.72a.75.75 0 011.06 1.06L9.06 8l2.72 2.72a.75.75 0 01-1.06 1.06L8 9.06l-2.72 2.72a.75.75 0 01-1.06-1.06L6.94 8 4.22 5.28a.75.75 0 010-1.06z"/>
-                                    </svg>
-                                </button>
-                            </div>
-                        {/each}
-                    </div>
-
-                    <!-- Controls -->
-                    <div class="px-4 pt-2 pb-4 flex flex-col gap-4 border-t border-neutral-100 dark:border-neutral-800">
-                        <FormatSelector {format} onchange={handleFormatChange} />
-                        <div class="border-t border-neutral-100 dark:border-neutral-800"></div>
-                        <QualitySlider {quality} onchange={handleQualityChange} disabled={format === 'image/png'} />
-                        {#if format !== 'image/png'}
-                            <div class="border-t border-neutral-100 dark:border-neutral-800"></div>
-                        {/if}
-                        {#if selectedItem}
-                            <ResizeControl
-                                    enabled={cropEnabled}
-                                    width={crop.width || selectedItem.width}
-                                    height={crop.height || selectedItem.height}
-                                    lockAspect={cropLockAspect}
-                                    originalWidth={selectedItem.width}
-                                    originalHeight={selectedItem.height}
-                                    ontoggle={handleCropToggle}
-                                    ontogglelock={handleCropLockToggle}
-                                    onchange={handleCropChange}
-                            />
-                        {/if}
-                    </div>
-                </div>
-
-                <!-- Footer: download + batch -->
-                <div class="shrink-0 p-3 border-t border-neutral-100 dark:border-neutral-800 flex flex-col gap-2">
-                    <div class="flex gap-2">
-                        <Button
-                                onclick={downloadSelected}
-                                disabled={!selectedItem?.convertedBlob || selectedItem?.converting}
-                                class="flex-1"
-                        >
-                            {selectedItem?.converting ? 'Converting…' : 'Download'}
-                            {#if selectedItem && !selectedItem.converting && savings !== null && savings > 0}
-                                <span class="opacity-70 text-xs ml-1">−{savings}%</span>
-                            {/if}
-                        </Button>
-                        <button
-                                onclick={copyToClipboard}
-                                disabled={!selectedItem?.convertedBlob || selectedItem?.converting}
-                                class="px-3 rounded-lg border text-xs font-medium transition-colors cursor-pointer shrink-0
-                     disabled:opacity-40 disabled:cursor-not-allowed
-                     {copyState === 'copied'
-                       ? 'border-green-500 text-green-600 dark:text-green-400 bg-green-50 dark:bg-green-950'
-                       : copyState === 'error'
-                       ? 'border-red-400 text-red-500'
-                       : 'border-neutral-200 dark:border-neutral-700 text-neutral-600 dark:text-neutral-400 hover:border-neutral-400 dark:hover:border-neutral-500'}"
-                                title="Copy to clipboard"
-                        >
-                            {copyState === 'copied' ? '✓ Copied' : copyState === 'error' ? 'Failed' : 'Copy'}
-                        </button>
-                    </div>
-                    {#if items.length > 1}
-                        <div class="flex gap-2">
-                            <Button onclick={handleDownloadAll} disabled={downloadingZip} class="flex-1 text-xs">
-                                {downloadingZip ? 'Zipping…' : `All (${items.length})`}
-                            </Button>
-                            <Button variant="secondary" onclick={clearAll} class="flex-1 text-xs">Clear</Button>
-                        </div>
-                    {:else}
-                        <Button variant="secondary" onclick={clearAll} class="w-full text-xs">Clear all</Button>
-                    {/if}
-
-                    <!-- Keyboard hints -->
-                    <p class="text-center text-neutral-400 dark:text-neutral-600" style="font-size: 10px; line-height: 1.5;">
-                        ←→ divider · ↑↓ image · R reset · D diff
-                    </p>
-                </div>
-            </aside>
+            <Sidebar />
 
         </div>
     {/if}

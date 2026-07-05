@@ -1,15 +1,15 @@
 <script lang="ts">
-    import { onMount } from "svelte";
     import { Upload } from "@lucide/svelte";
 
     interface Props {
         onfiles: (files: File[]) => void;
+        compact?: boolean;
     }
 
-    let { onfiles }: Props = $props();
+    let { onfiles, compact = false }: Props = $props();
 
     let dragOver = $state(false);
-    let inputEl: HTMLInputElement;
+    let inputEl = $state<HTMLInputElement>();
 
     function filterImages(files: File[]): File[] {
         return files.filter((f) => f.type.startsWith("image/"));
@@ -44,7 +44,7 @@
         target.value = "";
     }
 
-    onMount(() => {
+    $effect(() => {
         function handlePaste(e: ClipboardEvent) {
             const files = Array.from(e.clipboardData?.items ?? [])
                 .filter((i) => i.type.startsWith("image/"))
@@ -59,33 +59,65 @@
     });
 </script>
 
-<div
-        class="relative flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed
-         py-10 px-6 cursor-pointer transition-colors
-         {dragOver
-           ? 'border-red-600 bg-red-600/10'
-           : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-500'}"
-        role="button"
-        tabindex="0"
-        aria-label="Drop zone: drop images, click to browse, or paste from clipboard"
-        ondrop={handleDrop}
-        ondragover={handleDragOver}
-        ondragleave={handleDragLeave}
-        onclick={() => inputEl.click()}
-        onkeydown={(e) => e.key === "Enter" && inputEl.click()}
->
-    <Upload class="size-6 text-neutral-500" />
+{#if compact}
+    <div
+            class="relative flex items-center justify-center gap-2 rounded-lg border border-dashed
+             py-2 px-3 cursor-pointer transition-colors
+             {dragOver
+               ? 'border-red-500 bg-red-500/10 text-red-500'
+               : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-500 text-neutral-500 hover:text-neutral-800 dark:hover:text-neutral-200'}"
+            role="button"
+            tabindex="0"
+            aria-label="Drop zone: drop images, click to browse, or paste from clipboard"
+            ondrop={handleDrop}
+            ondragover={handleDragOver}
+            ondragleave={handleDragLeave}
+            onclick={() => inputEl?.click()}
+            onkeydown={(e) => e.key === "Enter" && inputEl?.click()}
+    >
+        <Upload class="size-3.5 shrink-0" />
+        <span class="text-xs select-none">
+            {dragOver ? 'Drop to add' : '+ Add more images'}
+        </span>
 
-    <p class="text-sm text-neutral-500 text-center select-none">
-        Drop images here, click to browse, or paste from clipboard
-    </p>
+        <input
+                bind:this={inputEl}
+                type="file"
+                accept="image/*"
+                multiple
+                class="sr-only"
+                oninput={handleInput}
+        />
+    </div>
+{:else}
+    <div
+            class="relative flex flex-col items-center justify-center gap-2 rounded-xl border-2 border-dashed
+             py-10 px-6 cursor-pointer transition-colors
+             {dragOver
+               ? 'border-red-600 bg-red-600/10'
+               : 'border-neutral-300 dark:border-neutral-700 hover:border-neutral-500'}"
+            role="button"
+            tabindex="0"
+            aria-label="Drop zone: drop images, click to browse, or paste from clipboard"
+            ondrop={handleDrop}
+            ondragover={handleDragOver}
+            ondragleave={handleDragLeave}
+            onclick={() => inputEl?.click()}
+            onkeydown={(e) => e.key === "Enter" && inputEl?.click()}
+    >
+        <Upload class="size-6 text-neutral-500" />
 
-    <input
-            bind:this={inputEl}
-            type="file"
-            accept="image/*"
-            multiple
-            class="sr-only"
-            oninput={handleInput}
-    />
-</div>
+        <p class="text-sm text-neutral-500 text-center select-none">
+            Drop images here, click to browse, or paste from clipboard
+        </p>
+
+        <input
+                bind:this={inputEl}
+                type="file"
+                accept="image/*"
+                multiple
+                class="sr-only"
+                oninput={handleInput}
+        />
+    </div>
+{/if}

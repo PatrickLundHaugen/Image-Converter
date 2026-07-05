@@ -1,4 +1,6 @@
 <script lang="ts">
+    import { Lock, LockOpen } from "@lucide/svelte";
+
     interface Props {
         enabled: boolean;
         width: number;
@@ -71,7 +73,7 @@
                         id="crop-w"
                         type="number" min="1" max={originalWidth} value={width}
                         oninput={handleWidth}
-                        class="w-20 text-sm text-center tabular-nums rounded-md px-2 py-1.5
+                        class="w-20 text-sm text-center rounded-md px-2 py-1.5
                  bg-neutral-50 dark:bg-neutral-800
                  border border-neutral-200 dark:border-neutral-700
                  focus:outline-none focus:border-neutral-400 dark:focus:border-neutral-500
@@ -89,13 +91,9 @@
                  : 'border-neutral-200 dark:border-neutral-700 text-neutral-400 hover:border-neutral-400'}"
             >
                 {#if lockAspect}
-                    <svg viewBox="0 0 16 16" class="size-3.5 fill-current">
-                        <path d="M11 6V5a3 3 0 10-6 0v1H3v8h10V6h-2zM6 5a2 2 0 114 0v1H6V5z"/>
-                    </svg>
+                    <Lock class="size-4" />
                 {:else}
-                    <svg viewBox="0 0 16 16" class="size-3.5 fill-current">
-                        <path d="M11 1a3 3 0 00-3 3v2H3v8h10V6H7V4a2 2 0 114 0V5h1V4a3 3 0 00-3-3z"/>
-                    </svg>
+                    <LockOpen class="size-4" />
                 {/if}
             </button>
 
@@ -106,7 +104,7 @@
                         id="crop-h"
                         type="number" min="1" max={originalHeight} value={height}
                         oninput={handleHeight}
-                        class="w-20 text-sm text-center tabular-nums rounded-md px-2 py-1.5
+                        class="w-20 text-sm text-center rounded-md px-2 py-1.5
                  bg-neutral-50 dark:bg-neutral-800
                  border border-neutral-200 dark:border-neutral-700
                  focus:outline-none focus:border-neutral-400 dark:focus:border-neutral-500
